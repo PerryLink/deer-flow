@@ -1,5 +1,7 @@
 """Tests for AioSandbox concurrent command serialization (#1433)."""
 
+import base64
+import inspect
 import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -2031,6 +2033,112 @@ class TestReadFile:
         )
 
 
+class TestFileRequestBudgets:
+    """The locked file RPCs carry a client-only budget, not a server-side deadline (#5644).
+
+    ``download_file``, ``write_file``, and ``update_file`` all call the SDK file API
+    while holding ``self._lock``, the sandbox-wide serialization lock. That API
+    takes only ``request_options``: ``hard_timeout`` is documented "for command
+    execution" and exists on the shell/bash clients alone, so unlike ``list_dir``
+    these three have no server-side deadline for a host envelope to sit above --
+    the named constant *is* the client budget. Before this contract all three
+    inherited the SDK client's 600s transport budget, so one wedged download or
+    write held the sandbox lock for the full 600s. These tests pin each budget,
+    the no-retry envelope, the strict "below the SDK's own budget" property that
+    is the actual fix, and the SDK gap that forces a client-only bound.
+    """
+
+    @staticmethod
+    def _sdk_client_timeout() -> float:
+        """Read the transport budget from the real production client construction."""
+        from deerflow.community.aio_sandbox.aio_sandbox import AioSandbox
+
+        with (
+            patch("deerflow.community.aio_sandbox.aio_sandbox.httpx.Client", return_value=MagicMock()),
+            patch("deerflow.community.aio_sandbox.aio_sandbox.AioSandboxClient") as sdk_cls,
+        ):
+            AioSandbox(id="test-sandbox", base_url="http://host.docker.internal:8080")
+
+        return sdk_cls.call_args.kwargs["timeout"]
+
+    def test_every_file_budget_is_strictly_below_the_sdk_client_budget(self, sandbox):
+        """A budget at or above the SDK's own 600s client timeout would bound nothing."""
+        sdk_budget = self._sdk_client_timeout()
+        cls = type(sandbox)
+
+        assert sdk_budget == 600
+        for budget in (
+            cls._DOWNLOAD_FILE_CLIENT_TIMEOUT_SECONDS,
+            cls._WRITE_FILE_CLIENT_TIMEOUT_SECONDS,
+            cls._UPDATE_FILE_CLIENT_TIMEOUT_SECONDS,
+        ):
+            assert budget < sdk_budget
+
+    def test_download_file_sends_client_only_budget(self, sandbox):
+        """A streaming download is bounded by 120s of read silence, with no retry."""
+        calls = []
+
+        def download_file(path, **kwargs):
+            calls.append({"path": path, **kwargs})
+            return iter([b"chunk"])
+
+        sandbox._client.file.download_file = download_file
+
+        assert sandbox.download_file("/mnt/user-data/outputs/file.bin") == b"chunk"
+
+        budget = type(sandbox)._DOWNLOAD_FILE_CLIENT_TIMEOUT_SECONDS
+        assert budget == 120.0
+        assert calls == [{"path": "/mnt/user-data/outputs/file.bin", "request_options": {"timeout_in_seconds": 120, "max_retries": 0}}]
+
+    @pytest.mark.parametrize("append", [False, True])
+    def test_write_file_sends_client_only_budget_on_both_branches(self, sandbox, append):
+        """Both write_file branches carry the 60s budget; a bare POST has no progress signal."""
+        write_file = MagicMock()
+        sandbox._client.file.write_file = write_file
+
+        sandbox.write_file("/mnt/user-data/workspace/report.txt", "payload", append=append)
+
+        budget = type(sandbox)._WRITE_FILE_CLIENT_TIMEOUT_SECONDS
+        assert budget == 60.0
+        kwargs = write_file.call_args.kwargs
+        assert kwargs["request_options"] == {"timeout_in_seconds": 60, "max_retries": 0}
+        assert kwargs.get("append", False) is append
+
+    def test_update_file_keeps_base64_encoding_and_sends_client_only_budget(self, sandbox):
+        """update_file is a base64 write_file; losing encoding="base64" corrupts every upload."""
+        write_file = MagicMock()
+        sandbox._client.file.write_file = write_file
+
+        sandbox.update_file("/mnt/user-data/uploads/blob.bin", b"\x00\xffpayload")
+
+        budget = type(sandbox)._UPDATE_FILE_CLIENT_TIMEOUT_SECONDS
+        assert budget == 180.0
+        write_file.assert_called_once_with(
+            file="/mnt/user-data/uploads/blob.bin",
+            content=base64.b64encode(b"\x00\xffpayload").decode("utf-8"),
+            encoding="base64",
+            request_options={"timeout_in_seconds": 180, "max_retries": 0},
+        )
+
+    def test_file_api_still_has_no_server_side_deadline(self):
+        """Tripwire for the SDK limitation that forces a client-only bound here.
+
+        While ``FileClient`` exposes no ``hard_timeout`` -- it exists on
+        ``ShellClient.exec_command`` only, documented "for command execution" -- a
+        client budget is the only bound these three call sites can have. If this
+        fails, the SDK grew a server-side file deadline and the constants above
+        should derive from it, as ``_LIST_DIR_TIMEOUT_SECONDS`` does.
+        """
+        from agent_sandbox.file.client import FileClient
+        from agent_sandbox.shell.client import ShellClient
+
+        assert "hard_timeout" in inspect.signature(ShellClient.exec_command).parameters
+        for method in (FileClient.download_file, FileClient.write_file):
+            parameters = inspect.signature(method).parameters
+            assert "request_options" in parameters
+            assert "hard_timeout" not in parameters, f"{method.__name__} gained a server-side deadline; derive the budget from it instead of a client-only constant"
+
+
 class TestWriteFile:
     def test_append_uses_server_append_without_pre_read(self, sandbox):
         sandbox._client.file.read_file = MagicMock(side_effect=RuntimeError("read timed out"))
@@ -2043,6 +2151,7 @@ class TestWriteFile:
             file="/mnt/user-data/workspace/report.txt",
             content="tail",
             append=True,
+            request_options={"timeout_in_seconds": 60, "max_retries": 0},
         )
 
     def test_overwrite_keeps_existing_request_shape(self, sandbox):
@@ -2053,6 +2162,7 @@ class TestWriteFile:
         sandbox._client.file.write_file.assert_called_once_with(
             file="/mnt/user-data/workspace/report.txt",
             content="replacement",
+            request_options={"timeout_in_seconds": 60, "max_retries": 0},
         )
 
 
@@ -2103,7 +2213,10 @@ class TestDownloadFile:
         result = sandbox.download_file("/mnt/user-data/outputs/file.bin")
 
         assert result == b"hello"
-        sandbox._client.file.download_file.assert_called_once_with(path="/mnt/user-data/outputs/file.bin")
+        sandbox._client.file.download_file.assert_called_once_with(
+            path="/mnt/user-data/outputs/file.bin",
+            request_options={"timeout_in_seconds": 120, "max_retries": 0},
+        )
 
     def test_returns_empty_bytes_for_empty_file(self, sandbox):
         """download_file should return b'' when the iterator yields nothing."""
@@ -2117,7 +2230,7 @@ class TestDownloadFile:
         """download_file should hold the lock while calling the client."""
         lock_was_held = []
 
-        def tracking_download(path):
+        def tracking_download(path, **kwargs):
             lock_was_held.append(sandbox._lock.locked())
             return iter([b"data"])
 

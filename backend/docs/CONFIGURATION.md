@@ -641,7 +641,11 @@ request is bounded there. On supported semver AIO images, `list_dir` uses a 60
 second server-side hard timeout with a 65 second no-retry host envelope; the
 frozen legacy image only gets the bounded host wait. Timed-out or otherwise
 ambiguous commands are never replayed, and a partial `list_dir` result is never
-returned as a complete listing.
+returned as a complete listing. The file RPCs have no server-side deadline to
+enforce — the SDK file API exposes no `hard_timeout` — so their host-side
+requests carry a client-only budget instead of the SDK's 600 second default:
+120 seconds for `download_file`, 60 for `write_file`, and 180 for `update_file`,
+none of them retried.
 
 **BoxLite micro-VM Sandbox** (runs sandbox code in daemonless OCI micro-VMs):
 ```yaml

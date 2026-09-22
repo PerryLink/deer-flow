@@ -571,6 +571,29 @@ class AioSandbox(Sandbox):
     # private constant rather than new operator config.
     _LIST_DIR_TIMEOUT_SECONDS = 60.0
 
+    # Client-only request budgets for the file RPCs (#5644). These are *not*
+    # server-side deadlines like ``_LIST_DIR_TIMEOUT_SECONDS``: the SDK's file API
+    # takes only ``request_options`` and exposes no ``hard_timeout`` -- that
+    # parameter is documented "for command execution" and exists on the
+    # shell/bash clients alone -- so the value here *is* the client budget and
+    # the entire bound on the call. That is an SDK limitation, not an oversight
+    # here, and it is why these are named ``*_CLIENT_TIMEOUT_SECONDS`` while
+    # ``list_dir``'s server-side deadline derives a larger host envelope from
+    # itself. Each must stay strictly below the 600s transport budget the SDK
+    # client is constructed with, or a stalled RPC holds ``self._lock`` -- the
+    # sandbox-wide serialization lock -- for that full 600s.
+    #
+    # ``download_file`` streams, and httpx applies the timeout per read, so 120s
+    # bounds silence between chunks rather than total transfer time: a large but
+    # progressing download is not killed. ``write_file`` is a single
+    # non-streaming JSON POST with no progress signal at all, so 60s of silence
+    # is already a wedge. ``update_file`` is that same non-streaming write
+    # carrying base64 content (~1.37x inflation) for uploads and artifacts, so
+    # it gets 180s.
+    _DOWNLOAD_FILE_CLIENT_TIMEOUT_SECONDS = 120.0
+    _WRITE_FILE_CLIENT_TIMEOUT_SECONDS = 60.0
+    _UPDATE_FILE_CLIENT_TIMEOUT_SECONDS = 180.0
+
     def _effective_command_timeout(self, timeout: float | None) -> float:
         return timeout if timeout is not None else (getattr(self, "_default_command_timeout", None) or self._DEFAULT_HARD_TIMEOUT)
 
@@ -588,6 +611,28 @@ class AioSandbox(Sandbox):
                 1,
                 math.ceil(timeout + cls._REQUEST_TIMEOUT_GRACE_SECONDS),
             ),
+            "max_retries": 0,
+        }
+
+    @classmethod
+    def _client_only_request_options(cls, timeout_seconds: float) -> dict[str, int]:
+        """Budget an RPC whose SDK API has no server-side deadline.
+
+        ``timeout_seconds`` is the client budget itself, not a server-side
+        timeout to derive one from, so unlike ``_command_request_options`` no
+        grace is added: the named constant is what goes on the wire. ``list_dir``
+        cannot use this helper because it has a real server-side ``hard_timeout``
+        to sit above; the file RPCs have only this client bound.
+
+        ``max_retries=0`` is defensive rather than part of the fix: the SDK
+        already defaults to 0 (``max_retries = request_options.get("max_retries", 0)``
+        in ``core/http_client.py``), and its retry branch runs on a *response*
+        only for 5xx/429/408/409, so a transport timeout never reaches it. Pinning
+        it keeps every future replay of a stalled file RPC from holding the
+        sandbox lock for another full budget.
+        """
+        return {
+            "timeout_in_seconds": max(1, math.ceil(timeout_seconds)),
             "max_retries": 0,
         }
 
@@ -898,7 +943,8 @@ class AioSandbox(Sandbox):
             try:
                 chunks: list[bytes] = []
                 total = 0
-                for chunk in self._client.file.download_file(path=path):
+                request_options = self._client_only_request_options(self._DOWNLOAD_FILE_CLIENT_TIMEOUT_SECONDS)
+                for chunk in self._client.file.download_file(path=path, request_options=request_options):
                     total += len(chunk)
                     if total > _MAX_DOWNLOAD_SIZE:
                         raise OSError(
@@ -1013,10 +1059,11 @@ class AioSandbox(Sandbox):
         """
         with self._lock:
             try:
+                request_options = self._client_only_request_options(self._WRITE_FILE_CLIENT_TIMEOUT_SECONDS)
                 if append:
-                    self._client.file.write_file(file=path, content=content, append=True)
+                    self._client.file.write_file(file=path, content=content, append=True, request_options=request_options)
                 else:
-                    self._client.file.write_file(file=path, content=content)
+                    self._client.file.write_file(file=path, content=content, request_options=request_options)
             except Exception as e:
                 logger.error(f"Failed to write file in sandbox: {e}")
                 raise
@@ -1125,7 +1172,8 @@ class AioSandbox(Sandbox):
         with self._lock:
             try:
                 base64_content = base64.b64encode(content).decode("utf-8")
-                self._client.file.write_file(file=path, content=base64_content, encoding="base64")
+                request_options = self._client_only_request_options(self._UPDATE_FILE_CLIENT_TIMEOUT_SECONDS)
+                self._client.file.write_file(file=path, content=base64_content, encoding="base64", request_options=request_options)
             except Exception as e:
                 logger.error(f"Failed to update file in sandbox: {e}")
                 raise
